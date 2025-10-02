@@ -1,0 +1,8 @@
+# Ignore all .nii.gz files everywhere
+*.nii.gz
+
+# Ignore prediction results folder
+preds_010_fullres/
+
+# Ignore datasets under nnUNetFrame
+**/dataset/
