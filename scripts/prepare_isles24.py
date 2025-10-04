@@ -1,105 +1,7 @@
-# #!/usr/bin/env python3
-# import argparse, os, re, shutil
-# from pathlib import Path
-# from typing import List, Tuple
-
-# # -------- Patterns (match your screenshot) --------
-# TMAX_PATTERN  = "_space-ncct_tmax.nii.gz"   # perfusion-maps/*tmax.nii.gz
-# LABEL_PATTERN = "_lesion-msk.nii.gz"        # annotation mask
-# # --------------------------------------------------
-
-# TRAIN_FRACTION = 0.8
-# SHUFFLE = False
-# RANDOM_SEED = 42
-
-# def extract_subject_id(p: Path) -> str | None:
-#     """
-#     Get the numeric id '0001' from names/dirs like:
-#       sub-stroke0001_ses-01_space-ncct_tmax.nii.gz
-#       .../sub-stroke0001/ses-02/..._lesion-msk.nii.gz
-#     """
-#     m = re.search(r"sub-stroke(\d+)", p.name)
-#     if not m:
-#         for part in p.parts[::-1]:
-#             m = re.search(r"sub-stroke(\d+)", part)
-#             if m: break
-#     return m.group(1).zfill(4) if m else None
-
-# def find_pairs(roots: List[Path]) -> List[Tuple[str, Path, Path]]:
-#     """
-#     Return (subject_id, tmax_path, label_path). Only keep subjects having both.
-#     """
-#     idx = {}
-#     for root in roots:
-#         # search anywhere under derivatives/ for perfusion-maps and labels
-#         for p in root.rglob(f"*{TMAX_PATTERN}"):
-#             sid = extract_subject_id(p);  
-#             if not sid: continue
-#             rec = idx.setdefault(sid, {"tmax": None, "label": None})
-#             rec["tmax"] = p
-#         for p in root.rglob(f"*{LABEL_PATTERN}"):
-#             sid = extract_subject_id(p);  
-#             if not sid: continue
-#             rec = idx.setdefault(sid, {"tmax": None, "label": None})
-#             rec["label"] = p
-
-#     out = []
-#     for sid, rec in idx.items():
-#         if rec["tmax"] is not None and rec["label"] is not None:
-#             out.append((sid, rec["tmax"], rec["label"]))
-#     return out
-
-# def cp_or_mv(src: Path, dst: Path, move: bool):
-#     dst.parent.mkdir(parents=True, exist_ok=True)
-#     (shutil.move if move else shutil.copy2)(src, dst)
-
-# def main():
-#     ap = argparse.ArgumentParser(description="Create nnU-Netv2 dataset from ISLES24 (Tmax + labels).")
-#     ap.add_argument("--in-roots", nargs="+", required=True,
-#                     help="Roots like: /data/isles24_train-1 /data/isles24_train-2 (searches recursively)")
-#     ap.add_argument("--out-root", required=True,
-#                     help="Output dataset root, e.g. $nnUNet_raw/Dataset000_ISLES24_CTA")
-#     ap.add_argument("--train-frac", type=float, default=TRAIN_FRACTION)
-#     ap.add_argument("--shuffle", action="store_true", default=SHUFFLE)
-#     ap.add_argument("--move", action="store_true", help="Move instead of copy")
-#     args = ap.parse_args()
-
-#     roots = [Path(p).expanduser().resolve() for p in args.in_roots]
-#     out_root = Path(args.out_root).expanduser().resolve()
-#     imagesTr = out_root / "imagesTr"; labelsTr = out_root / "labelsTr"; imagesTs = out_root / "imagesTs"
-#     for d in (imagesTr, labelsTr, imagesTs): d.mkdir(parents=True, exist_ok=True)
-
-#     pairs = find_pairs(roots)
-#     if not pairs:
-#         raise SystemExit(f"No (Tmax,label) pairs found. Patterns: TMAX='{TMAX_PATTERN}', LABEL='{LABEL_PATTERN}'")
-
-#     # stable order by subject id; optional shuffle
-#     pairs.sort(key=lambda t: int(t[0]))
-#     if args.shuffle:
-#         import random; random.seed(RANDOM_SEED); random.shuffle(pairs)
-
-#     n = len(pairs); n_tr = int(round(n * args.train_frac))
-#     train_pairs, test_pairs = pairs[:n_tr], pairs[n_tr:]
-
-#     # --- write train (Tmax -> channel 0) ---
-#     for sid, tmax_p, lab_p in train_pairs:
-#         cp_or_mv(tmax_p, imagesTr / f"case_{sid}_0000.nii.gz", args.move)
-#         cp_or_mv(lab_p,  labelsTr / f"case_{sid}.nii.gz",      args.move)
-
-#     # --- write test (Tmax only) ---
-#     for sid, tmax_p, _ in test_pairs:
-#         cp_or_mv(tmax_p, imagesTs / f"case_{sid}_0000.nii.gz", args.move)
-
-#     print(f"Done. Subjects: {n} | train: {len(train_pairs)} | test: {len(test_pairs)}")
-#     print(f"Dataset root: {out_root}")
-#     print(f" e.g., {imagesTr/'case_0001_0000.nii.gz'} ; {labelsTr/'case_0001.nii.gz'}")
-
-# if __name__ == "__main__":
-#     main()
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-ISLES'24 → nnU-Net v2 (multimodal) with skull-strip + per-modality clipping (single-process).
+ISLES'24 → nnU-Net v2 (multimodal) with label-aware skull-strip
++ per-modality clipping (single-process), using a final mask that
+covers brain plus a small padded band around the lesion.
 
 Inputs (found recursively under --in-roots):
   NCCT (RAW):      .../raw_data/sub-strokeXXXX/ses-01/sub-strokeXXXX_ses-01_ncct.nii.gz
@@ -112,19 +14,20 @@ Inputs (found recursively under --in-roots):
   Label (GT):      .../derivatives/sub-strokeXXXX/ses-02/sub-strokeXXXX_ses-02_lesion-msk.nii.gz
 
 Outputs (to $nnUNet_raw/Dataset{ID}_{NAME} or --out-root):
-  imagesTr/case_<ID>_0000.nii.gz   (ncct, float32, brain-masked, clipped 0–90)
-  imagesTr/case_<ID>_0001.nii.gz   (cta,  float32, mask, 0–90)
+  imagesTr/case_<ID>_0000.nii.gz   (ncct, float32, brain+lesion-padded mask, clipped 0–90)
+  imagesTr/case_<ID>_0001.nii.gz   (cta,  float32, mask, 0–300)
   imagesTr/case_<ID>_0002.nii.gz   (cbv,  float32, mask, 0–10)
-  imagesTr/case_<ID>_0003.nii.gz   (cbf,  float32, mask, 0–35)
+  imagesTr/case_<ID>_0003.nii.gz   (cbf,  float32, mask, 0–80)
   imagesTr/case_<ID>_0004.nii.gz   (mtt,  float32, mask, 0–20)
-  imagesTr/case_<ID>_0005.nii.gz   (tmax, float32, mask, 0–7)
+  imagesTr/case_<ID>_0005.nii.gz   (tmax, float32, mask, 0–10)
   labelsTr/case_<ID>.nii.gz        (uint8, background=0, lesion=1)
-  imagesTs/...                      (same channels; no labels)
+  imagesTs/...                      (same channels; labelsTs kept only for QA)
   dataset.json
 
 Notes:
 - No multiprocessing; purely sequential for reliability.
-- Labels are only NN-resampled to NCCT grid if needed (never altered otherwise).
+- Labels are only NN-resampled to NCCT grid if needed (never otherwise altered).
+- Final intensity mask = dilated(brain) OR dilated(label) to avoid label-on-zeros.
 """
 
 from __future__ import annotations
@@ -136,39 +39,33 @@ import SimpleITK as sitk
 from nnunetv2.dataset_conversion.generate_dataset_json import generate_dataset_json
 from nnunetv2.paths import nnUNet_raw
 
-
 # ---------- path patterns (match your tree exactly) ----------
 PATTERNS = {
-    # NCCT from RAW (reference grid)
     "ncct": [
-        "**/raw_data/sub-stroke*/ses-01/*_ses-01_ncct.nii.gz",        # e.g. .../raw_data/sub-stroke0001/ses-01/sub-stroke0001_ses-01_ncct.nii.gz
-        "**/raw_data/sub-stroke*/ses-01/*_ses-01_*ncct.nii.gz",       # fallback variant
-        "**/derivatives/sub-stroke*/ses-01/*space-ncct_ncct.nii.gz",  # rare preprocessed NCCT (fallback)
+        "**/raw_data/sub-stroke*/ses-01/*_ses-01_ncct.nii.gz",
+        "**/raw_data/sub-stroke*/ses-01/*_ses-01_*ncct.nii.gz",
+        "**/derivatives/sub-stroke*/ses-01/*space-ncct_ncct.nii.gz",
     ],
-    # CTA in derivatives/ses-01
     "cta":  ["**/derivatives/sub-stroke*/ses-01/*_ses-01_space-ncct_cta.nii.gz"],
-    # Perfusion maps in derivatives/ses-01/perfusion-maps
     "cbf":  ["**/derivatives/sub-stroke*/ses-01/perfusion-maps/*_ses-01_space-ncct_cbf.nii.gz"],
     "cbv":  ["**/derivatives/sub-stroke*/ses-01/perfusion-maps/*_ses-01_space-ncct_cbv.nii.gz"],
     "mtt":  ["**/derivatives/sub-stroke*/ses-01/perfusion-maps/*_ses-01_space-ncct_mtt.nii.gz"],
     "tmax": ["**/derivatives/sub-stroke*/ses-01/perfusion-maps/*_ses-01_space-ncct_tmax.nii.gz"],
-    # Lesion label in derivatives/ses-02
     "label":["**/derivatives/sub-stroke*/ses-02/*_ses-02_lesion-msk.nii.gz"],
 }
 
-# ---------- intensity windows ----------
+# ---------- intensity windows (fixed caps; keep simple/robust) ----------
 WINDOWS = {
     "ncct": (0.0, 90.0),
-    "cta":  (0.0, 90.0),
+    "cta":  (0.0, 300.0),  # widened to preserve vessels/contrast
     "cbv":  (0.0, 10.0),
-    "cbf":  (0.0, 35.0),
+    "cbf":  (0.0, 80.0),   # allow normal GM range across vendors
     "mtt":  (0.0, 20.0),
-    "tmax": (0.0, 7.0),
+    "tmax": (0.0, 10.0),   # a bit looser than 0–7
 }
 
-# nnU-Net channel ordering
-# CHANNEL_ORDER = ["ncct", "cta", "cbv", "cbf", "mtt", "tmax"]  # -> _0000.._0005
-CHANNEL_ORDER = ["cta","cbv", "cbf", "mtt", "tmax"]
+# nnU-Net channel ordering -> _0000.._0005
+CHANNEL_ORDER = ["ncct","cta","cbv","cbf","mtt","tmax"]
 
 # ---------- utilities ----------
 SUBJ_PAT = re.compile(r"sub-stroke(\d+)")
@@ -179,7 +76,8 @@ def extract_subject_id(p: Path) -> Optional[str]:
     if not m:
         for part in p.parts[::-1]:
             m = SUBJ_PAT.search(part)
-            if m: break
+            if m:
+                break
     return ID4(m.group(1)) if m else None
 
 def mm_to_radius(mm: float, spacing: tuple[float,float,float]) -> List[int]:
@@ -193,36 +91,71 @@ def resample_like(img: sitk.Image, ref: sitk.Image, interp=sitk.sitkLinear, defa
     rs.SetDefaultPixelValue(default)
     return rs.Execute(img)
 
-def skull_strip_from_ncct(ncct: sitk.Image,
-                          clamp=(-100, 200), soft=(-15,100),
-                          close_mm=3.0, erode_mm=3.0,
-                          skull_hu=250, shave_mm=1.5) -> sitk.Image:
-    sp = ncct.GetSpacing()
-    clamped = sitk.Clamp(ncct, lowerBound=clamp[0], upperBound=clamp[1])
-    softmask = sitk.BinaryThreshold(clamped, lowerThreshold=soft[0], upperThreshold=soft[1],
-                                    insideValue=1, outsideValue=0)
-    softmask = sitk.BinaryMorphologicalClosing(softmask, mm_to_radius(close_mm, sp))
-    softmask = sitk.VotingBinaryIterativeHoleFilling(
-        softmask, radius=mm_to_radius(2.0, sp), majorityThreshold=1,
-        backgroundValue=0, foregroundValue=1, maximumNumberOfIterations=1
+def verify_and_align_label(img: sitk.Image, ref: sitk.Image) -> sitk.Image:
+    """Verify and ensure label alignment with reference image"""
+    needs_resampling = (
+        img.GetSize() != ref.GetSize() or
+        img.GetSpacing() != ref.GetSpacing() or
+        img.GetDirection() != ref.GetDirection() or
+        img.GetOrigin() != ref.GetOrigin()
     )
-    cc = sitk.ConnectedComponent(softmask)
+    if needs_resampling:
+        print("Warning: Label needs resampling to match reference image")
+        img = resample_like(img, ref, sitk.sitkNearestNeighbor, default=0)
+    return img
+
+def verify_label_coverage(label_bin: sitk.Image, mask: sitk.Image) -> float:
+    """Check what percentage of label is within a given mask"""
+    label_binary = sitk.Cast(label_bin > 0, sitk.sitkUInt8)
+    intersection = sitk.Multiply(label_binary, mask)
+    label_voxels = sitk.GetArrayFromImage(label_binary).sum()
+    intersection_voxels = sitk.GetArrayFromImage(intersection).sum()
+    if label_voxels == 0:
+        return 0.0
+    return float(intersection_voxels) / float(label_voxels)
+
+def keep_components_touching_label(mask: sitk.Image, label_bin: sitk.Image) -> sitk.Image:
+    """Keep only connected components of mask that touch the lesion (fallback to largest)."""
+    cc = sitk.ConnectedComponent(mask)
     stats = sitk.LabelShapeStatisticsImageFilter(); stats.Execute(cc)
     if not stats.GetLabels():
-        raise RuntimeError("Skull-strip: no components found – adjust thresholds.")
-    largest = max(stats.GetLabels(), key=lambda l: stats.GetPhysicalSize(l))
-    brain = sitk.BinaryThreshold(cc, lowerThreshold=largest, upperThreshold=largest,
-                                 insideValue=1, outsideValue=0)
-    skull = sitk.BinaryThreshold(ncct, lowerThreshold=skull_hu, upperThreshold=3000,
-                                 insideValue=1, outsideValue=0)
-    brain = sitk.And(brain, sitk.BinaryNot(sitk.BinaryDilate(skull, mm_to_radius(shave_mm, sp))))
-    brain = sitk.BinaryErode(brain, mm_to_radius(erode_mm, sp))
-    brain = sitk.BinaryMorphologicalClosing(brain, mm_to_radius(2.0, sp))
-    cc2 = sitk.ConnectedComponent(brain)
-    stats2 = sitk.LabelShapeStatisticsImageFilter(); stats2.Execute(cc2)
-    largest2 = max(stats2.GetLabels(), key=lambda l: stats2.GetPhysicalSize(l))
-    brain = sitk.BinaryThreshold(cc2, lowerThreshold=largest2, upperThreshold=largest2,
-                                 insideValue=1, outsideValue=0)
+        return sitk.Cast(mask, sitk.sitkUInt8)
+    kept = None
+    for lab in stats.GetLabels():
+        comp = sitk.BinaryThreshold(cc, lowerThreshold=lab, upperThreshold=lab, insideValue=1, outsideValue=0)
+        if sitk.GetArrayFromImage(sitk.And(comp, label_bin)).any():
+            kept = comp if kept is None else sitk.Or(kept, comp)
+    if kept is None:
+        largest = max(stats.GetLabels(), key=lambda l: stats.GetPhysicalSize(l))
+        kept = sitk.BinaryThreshold(cc, lowerThreshold=largest, upperThreshold=largest, insideValue=1, outsideValue=0)
+    return sitk.Cast(kept, sitk.sitkUInt8)
+
+def skull_strip_from_ncct(ncct: sitk.Image,
+                          clamp=(-100, 200), soft=(-15,100),
+                          close_mm=3.0, erode_mm=1.0,
+                          skull_hu=250, shave_mm=0.8,
+                          label_img=None) -> sitk.Image:
+    """Gentle, label-aware skull strip on NCCT."""
+    sp = ncct.GetSpacing()
+    clamped = sitk.Clamp(ncct, lowerBound=clamp[0], upperBound=clamp[1])
+    softmask = sitk.BinaryThreshold(clamped, lowerThreshold=soft[0], upperThreshold=soft[1], insideValue=1, outsideValue=0)
+    softmask = sitk.BinaryMorphologicalClosing(softmask, mm_to_radius(close_mm, sp))
+    softmask = sitk.VotingBinaryIterativeHoleFilling(softmask, radius=mm_to_radius(2.0, sp),
+                                                     majorityThreshold=1, backgroundValue=0, foregroundValue=1,
+                                                     maximumNumberOfIterations=1)
+
+    skull = sitk.BinaryThreshold(ncct, lowerThreshold=skull_hu, upperThreshold=3000, insideValue=1, outsideValue=0)
+    brain0 = sitk.And(softmask, sitk.BinaryNot(sitk.BinaryDilate(skull, mm_to_radius(shave_mm, sp))))
+    brain0 = sitk.BinaryErode(brain0, mm_to_radius(erode_mm, sp))
+    brain0 = sitk.BinaryMorphologicalClosing(brain0, mm_to_radius(1.0, sp))
+
+    if label_img is not None:
+        label_bin = sitk.Cast(label_img > 0, sitk.sitkUInt8)
+        brain = keep_components_touching_label(brain0, label_bin)
+        brain = sitk.Or(brain, label_bin)  # ensure label retained
+    else:
+        brain = brain0
+
     return sitk.Cast(brain, sitk.sitkUInt8)
 
 def clip_and_mask(img: sitk.Image, mask: sitk.Image, vmin: float, vmax: float) -> sitk.Image:
@@ -254,35 +187,52 @@ def process_subject(sid: str, rec: Dict[str, Path], out_images: Path, out_labels
             print(f"[WARN] {sid}: missing '{key}', skipping.")
             return False
 
-    # NCCT as reference grid
+    # Read NCCT + label, align label to NCCT grid
     ncct = sitk.ReadImage(str(rec["ncct"]))
-    brain = skull_strip_from_ncct(ncct)
+    lab = sitk.ReadImage(str(rec["label"]))
+    lab = verify_and_align_label(lab, ncct)
+    lab_binary = sitk.Cast(lab > 0, sitk.sitkUInt8)
+
+    # Skull-strip (label-aware) and build final masking mask
+    brain = skull_strip_from_ncct(ncct, label_img=lab_binary)
+
+    # Final mask for intensities: small padding around both brain and label
+    context_mm = 1.0
+    label_pad_mm = 2.0
+    brain_pad  = sitk.BinaryDilate(brain,      mm_to_radius(context_mm, ncct.GetSpacing()))
+    label_pad  = sitk.BinaryDilate(lab_binary, mm_to_radius(label_pad_mm, ncct.GetSpacing()))
+    mask_final = sitk.Or(brain_pad, label_pad)
+
+    # QA: lesion coverage and outside count
+    coverage = verify_label_coverage(lab_binary, mask_final)
+    outside = sitk.And(lab_binary, sitk.BinaryNot(mask_final))
+    n_out = int(sitk.GetArrayFromImage(outside).sum())
+    if coverage < 0.995 or n_out > 0:
+        print(f"[QA] {sid}: lesion coverage {coverage*100:.2f}% | voxels outside mask_final: {n_out}")
+
     if mask_dir:
         mask_dir.mkdir(parents=True, exist_ok=True)
-        sitk.WriteImage(brain, str(mask_dir / f"case_{sid}_brainmask.nii.gz"))
+        sitk.WriteImage(brain,      str(mask_dir / f"case_{sid}_brainmask.nii.gz"))
+        sitk.WriteImage(mask_final, str(mask_dir / f"case_{sid}_maskfinal.nii.gz"))
+        sitk.WriteImage(lab_binary, str(mask_dir / f"case_{sid}_label.nii.gz"))
 
-    # write channels
+    # Write channels (aligned to NCCT grid; linear for images)
     for ch, key in enumerate(CHANNEL_ORDER):
         img = sitk.ReadImage(str(rec[key]))
         if (img.GetSize()!=ncct.GetSize() or img.GetSpacing()!=ncct.GetSpacing() or
             img.GetDirection()!=ncct.GetDirection() or img.GetOrigin()!=ncct.GetOrigin()):
             img = resample_like(img, ncct, sitk.sitkLinear, default=0.0)
         vmin, vmax = WINDOWS[key]
-        out = clip_and_mask(img, brain, vmin, vmax)
+        out = clip_and_mask(img, mask_final, vmin, vmax)
         sitk.WriteImage(out, str(out_images / f"case_{sid}_{ch:04d}.nii.gz"))
 
-    # write label (uint8), NN-resampled if needed
-    lab = sitk.ReadImage(str(rec["label"]))
-    if (lab.GetSize()!=ncct.GetSize() or lab.GetSpacing()!=ncct.GetSpacing() or
-        lab.GetDirection()!=ncct.GetDirection() or lab.GetOrigin()!=ncct.GetOrigin()):
-        lab = resample_like(lab, ncct, sitk.sitkNearestNeighbor, default=0)
-    lab = sitk.Cast(lab>0, sitk.sitkUInt8)
-    sitk.WriteImage(lab, str(out_labels / f"case_{sid}.nii.gz"))
+    # Write label (uint8) using the already-aligned lab_binary
+    sitk.WriteImage(lab_binary, str(out_labels / f"case_{sid}.nii.gz"))
     return True
 
 # ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser(description="ISLES'24 → nnU-Net v2 (ncct+cta+cbv+cbf+mtt+tmax), skull-strip & clipping (single-process).")
+    ap = argparse.ArgumentParser(description="ISLES'24 → nnU-Net v2 (ncct+cta+cbv+cbf+mtt+tmax), label-aware skull-strip & clipping (single-process).")
     ap.add_argument("--in-roots", nargs="+", required=True,
                     help="Top-level ISLES roots, e.g. /bhome/test/isles24_train-1 /bhome/test/isles24_train-2/isles24_train_b")
     ap.add_argument("--dataset-id", type=int, required=True, help="e.g., 010")
@@ -291,7 +241,7 @@ def main():
                     help="Explicit output root (else uses $nnUNet_raw/Dataset{ID}_{NAME})")
     ap.add_argument("--train-frac", type=float, default=0.8)
     ap.add_argument("--shuffle", action="store_true", help="Shuffle subjects before split.")
-    ap.add_argument("--save-brainmasks", action="store_true", help="Save brain masks for QA.")
+    ap.add_argument("--save-brainmasks", action="store_true", help="Save brain/final masks for QA.")
     args = ap.parse_args()
 
     # Resolve output base
@@ -301,10 +251,13 @@ def main():
         if not nnUNet_raw:
             sys.exit("nnUNet_raw is not set (nnunetv2.paths.nnUNet_raw). Use --out-root or export nnUNet_raw.")
         out_base = Path(nnUNet_raw) / f"Dataset{args.dataset_id:03d}_{args.dataset_name}"
+
     out_imagesTr = out_base / "imagesTr"
     out_labelsTr = out_base / "labelsTr"
     out_imagesTs = out_base / "imagesTs"
-    for d in (out_imagesTr, out_labelsTr, out_imagesTs): d.mkdir(parents=True, exist_ok=True)
+    out_labelsTs = out_base / "labelsTs"  # nnU-Net ignores labelsTs; kept for QA only
+    for d in (out_imagesTr, out_labelsTr, out_imagesTs, out_labelsTs):
+        d.mkdir(parents=True, exist_ok=True)
     mask_dir = (out_base / "brainmasks") if args.save_brainmasks else None
 
     roots = [Path(r).expanduser().resolve() for r in args.in_roots]
@@ -331,22 +284,50 @@ def main():
         except Exception as e:
             print(f"Train {sid}: FAIL - {e}")
 
-    # process TEST sequentially (images only)
+    # process TEST sequentially (including labels for QA)
     for sid in test_sids:
         try:
             rec = index[sid]
+
+            # Read NCCT + label, align label to NCCT grid
             ncct = sitk.ReadImage(str(rec["ncct"]))
-            brain = skull_strip_from_ncct(ncct)
+            lab = sitk.ReadImage(str(rec["label"]))
+            lab = verify_and_align_label(lab, ncct)
+            lab_binary = sitk.Cast(lab > 0, sitk.sitkUInt8)
+
+            # Skull-strip (label-aware) and build final masking mask
+            brain = skull_strip_from_ncct(ncct, label_img=lab_binary)
+            context_mm = 1.0
+            label_pad_mm = 0.3
+            brain_pad  = sitk.BinaryDilate(brain,      mm_to_radius(context_mm, ncct.GetSpacing()))
+            label_pad  = sitk.BinaryDilate(lab_binary, mm_to_radius(label_pad_mm, ncct.GetSpacing()))
+            mask_final = sitk.Or(brain_pad, label_pad)
+
             if mask_dir:
-                sitk.WriteImage(brain, str(mask_dir / f"case_{sid}_brainmask.nii.gz"))
+                sitk.WriteImage(brain,      str(mask_dir / f"case_{sid}_brainmask.nii.gz"))
+                sitk.WriteImage(mask_final, str(mask_dir / f"case_{sid}_maskfinal.nii.gz"))
+                sitk.WriteImage(lab_binary, str(mask_dir / f"case_{sid}_label.nii.gz"))
+
+            # Process and save images
             for ch, key in enumerate(CHANNEL_ORDER):
                 img = sitk.ReadImage(str(rec[key]))
                 if (img.GetSize()!=ncct.GetSize() or img.GetSpacing()!=ncct.GetSpacing() or
                     img.GetDirection()!=ncct.GetDirection() or img.GetOrigin()!=ncct.GetOrigin()):
                     img = resample_like(img, ncct, sitk.sitkLinear, default=0.0)
                 vmin, vmax = WINDOWS[key]
-                out = clip_and_mask(img, brain, vmin, vmax)
+                out = clip_and_mask(img, mask_final, vmin, vmax)
                 sitk.WriteImage(out, str(out_imagesTs / f"case_{sid}_{ch:04d}.nii.gz"))
+
+            # Save test label (QA)
+            sitk.WriteImage(lab_binary, str(out_labelsTs / f"case_{sid}.nii.gz"))
+
+            # QA prints
+            coverage = verify_label_coverage(lab_binary, mask_final)
+            outside = sitk.And(lab_binary, sitk.BinaryNot(mask_final))
+            n_out = int(sitk.GetArrayFromImage(outside).sum())
+            if coverage < 0.995 or n_out > 0:
+                print(f"[QA] {sid}: lesion coverage {coverage*100:.2f}% | voxels outside mask_final: {n_out}")
+
             print(f"Test  {sid}: OK")
         except Exception as e:
             print(f"Test  {sid}: FAIL - {e}")
@@ -364,8 +345,8 @@ def main():
         dataset_name=f"Dataset{args.dataset_id:03d}_{args.dataset_name}",
         reference="ISLES 2024 (NCCT+CTA+CBV+CBF+MTT+Tmax)",
         release="",
-        overwrite_image_reader_writer="NibabelIOWithReorient",
-        dataset_description="Brain-masked & clipped per modality; labels untouched; single-process.",
+        overwrite_image_reader_writer=None,  # avoid unexpected reorientation at I/O
+        dataset_description="Label-aware brain mask (+ small padding) & per-modality clipping; labels untouched; single-process.",
         dataset_license="Research; follow ISLES terms.",
         dataset_author=os.environ.get("USER","author")
     )

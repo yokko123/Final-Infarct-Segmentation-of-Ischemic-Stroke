@@ -2,7 +2,10 @@
 *.nii.gz
 
 # Ignore prediction results folder
-preds_010_fullres/
+preds_001_fullres/
 
 # Ignore datasets under nnUNetFrame
 **/dataset/
+
+montage_*.png
+isles_test_eval.csv

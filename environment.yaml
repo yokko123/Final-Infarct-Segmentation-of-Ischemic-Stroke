@@ -1,0 +1,5 @@
+name: nn_UNet
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+prefix: /bhome/sazidur/miniconda3/envs/nn_UNet
