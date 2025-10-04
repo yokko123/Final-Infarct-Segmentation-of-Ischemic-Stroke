@@ -9,3 +9,5 @@ preds_001_fullres/
 
 montage_*.png
 isles_test_eval.csv
+scripts/json_*
+scripts/preprocess.ipynb
