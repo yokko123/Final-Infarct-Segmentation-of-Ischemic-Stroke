@@ -16,9 +16,8 @@ The project aims to predict final infarct lesions using six imaging modalities:
 
 ### ISLES 2024 Dataset Preparation
 The preprocessing pipeline (`scripts/prepare_isles24.py`) includes:
-- Brain extraction with lesion-aware skull stripping
+- skull stripping
 - Intensity windowing
-- Label verification and coverage checks
 
 ## Setup and Installation
 
